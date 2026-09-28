@@ -32,7 +32,9 @@ SELECTOR = Path(os.environ.get("CLAUDE_SELECT_PATH", Path.home() / ".local" / "b
 FALLBACK_COOLDOWN = 60 * 60
 CONTINUE_MESSAGE = (
     "Your last turn was cut off by a Claude usage limit, and this issue has moved to another "
-    "Claude account. Continue the task you were working on; do not repeat work that is already complete."
+    "Claude account. Continue the task you were working on; do not repeat work that is already complete. "
+    # A resumed run gets none of Divernote's instructions, so the finish is spelled out.
+    "If it changes code, finish by committing it, pushing the issue branch and opening a pull request, then report the result."
 )
 
 
