@@ -14,6 +14,10 @@ SID = "22222222-2222-4333-8444-555555555555"
 LIMIT = "You've hit your session limit · resets 6:20pm (America/New_York)"
 
 FAKE_CLAUDE = r"""#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  [ "$CLAUDE_CONFIG_DIR" = "$KEYCHAIN_ACCOUNT" ] && { echo '{"loggedIn":true}'; exit 0; }
+  echo '{"loggedIn":false}'; exit 0
+fi
 echo "claude $CLAUDE_CONFIG_DIR" >> "$CALLS"
 trap 'echo "claude got TERM" >> "$CALLS"; [ -n "$idle" ] && kill "$idle"; exit 0' TERM
 sid=""; while [ $# -gt 0 ]; do case "$1" in --session-id|--resume) sid="$2";; esac; shift; done
@@ -62,6 +66,7 @@ class Runner(unittest.TestCase):
             "CALLS": str(self.calls),
             "LIMITED": str(self.accounts[0]),
             "LIMIT_TEXT": LIMIT,
+            "KEYCHAIN_ACCOUNT": "",
             "CLAUDE_SELECT_STATE": str(self.tmp / "state.json"),
             "CLAUDE_SELECT_ACCOUNTS": ",".join(f"claude{i + 1}={path}" for i, path in enumerate(self.accounts)),
             "CLAUDE_SELECT_SHARED_PROJECTS": str(self.tmp / "shared"),
@@ -112,6 +117,17 @@ class Runner(unittest.TestCase):
         (self.accounts[1] / ".credentials.json").unlink()
         self.run_claude("--session-id", SID, "--", "hi")
         self.assertEqual(self.calls_made(), ["claude a1"])
+
+    def test_keychain_only_account_is_selected_after_file_backed_accounts_cool_down(self):
+        self.accounts[2].mkdir()
+        self.env["KEYCHAIN_ACCOUNT"] = str(self.accounts[2])
+        self.run_claude("--session-id", SID, "--", "hi")
+        self.env["LIMITED"] = str(self.accounts[1])
+        self.run_claude("--resume", SID, "--", "go")
+        self.run_claude("--resume", SID, "--", "again")
+        self.assertEqual([call for call in self.calls_made() if call.startswith("claude")],
+                         ["claude a1", "claude a2", "claude a3"])
+        self.assertEqual(self.state()["divernote_current"], "claude3")
 
     def test_an_earlier_limit_in_the_shared_transcript_is_not_blamed_on_this_run(self):
         self.run_claude("--session-id", SID, "--", "hi")
