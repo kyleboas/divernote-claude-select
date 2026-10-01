@@ -55,17 +55,26 @@ def load_selector():
 
 
 def logged_in(config_dir):
-    """An account Claude can run: a refresh token counts, since Claude renews the access token."""
+    """An account Claude can run, including credentials stored in the OS keychain."""
     try:
         oauth = json.loads((Path(config_dir) / ".credentials.json").read_text()).get("claudeAiOauth") or {}
     except (OSError, ValueError, AttributeError):
-        return False
+        oauth = {}
     if isinstance(oauth.get("refreshToken"), str) and oauth["refreshToken"].strip():
         return True
     expires = oauth.get("expiresAt")
-    if not isinstance(oauth.get("accessToken"), str) or isinstance(expires, bool) or not isinstance(expires, (int, float)):
+    if isinstance(oauth.get("accessToken"), str) and not isinstance(expires, bool) and isinstance(expires, (int, float)):
+        if (expires / 1000 if expires > 100_000_000_000 else expires) > time.time() + 60:
+            return True
+    # Claude Code on macOS can keep an account's OAuth token in the keychain
+    # without writing .credentials.json. Ask Claude rather than reading secrets.
+    try:
+        result = subprocess.run([shutil.which("claude") or "claude", "auth", "status"],
+                                env={**os.environ, "CLAUDE_CONFIG_DIR": config_dir},
+                                capture_output=True, text=True, timeout=10, check=False)
+        return result.returncode == 0 and json.loads(result.stdout).get("loggedIn") is True
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return False
-    return (expires / 1000 if expires > 100_000_000_000 else expires) > time.time() + 60
 
 
 def eligible(sel, st, name, config_dir):
