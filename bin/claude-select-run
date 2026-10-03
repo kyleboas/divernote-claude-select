@@ -54,17 +54,36 @@ def load_selector():
     return module
 
 
-def logged_in(config_dir):
-    """An account Claude can run, including credentials stored in the OS keychain."""
-    # Stored tokens can be revoked or superseded by the macOS keychain.
-    # Claude's status, not the presence of a refresh token, is authoritative.
+def auth_status(env):
     try:
         result = subprocess.run([shutil.which("claude") or "claude", "auth", "status"],
-                                env={**os.environ, "CLAUDE_CONFIG_DIR": config_dir},
-                                capture_output=True, text=True, timeout=10, check=False)
+                                env=env, capture_output=True, text=True, timeout=10, check=False)
         return result.returncode == 0 and json.loads(result.stdout).get("loggedIn") is True
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return False
+
+
+def account_env(config_dir):
+    """Prefer native auth; bridge unexpired file credentials when macOS misses them."""
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
+    # An inherited token must never authenticate a different selected account.
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    if auth_status(env):
+        return env
+    try:
+        oauth = json.loads((Path(config_dir) / ".credentials.json").read_text()).get("claudeAiOauth", {})
+        token = oauth.get("accessToken")
+        if not isinstance(token, str) or not token or float(oauth.get("expiresAt", 0)) <= time.time() * 1000:
+            return None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    # Keep the token in the child environment, never argv, state, or logs.
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    return env if auth_status(env) else None
+
+
+def logged_in(config_dir):
+    return account_env(config_dir) is not None
 
 
 def eligible(sel, st, name, config_dir):
@@ -229,7 +248,9 @@ def main():
     name, config_dir = choose_account(sel)
     cwd = os.getcwd()
     trust_folder(config_dir, cwd)
-    env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
+    env = account_env(config_dir)
+    if env is None:
+        raise RuntimeError("Selected Claude account is no longer authenticated.")
     sid = session_id(args)
     transcript = transcript_path(config_dir, cwd, sid) if sid else None
     offset = transcript_size(transcript) if transcript else 0
