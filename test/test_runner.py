@@ -15,13 +15,20 @@ LIMIT = "You've hit your session limit · resets 6:20pm (America/New_York)"
 
 FAKE_CLAUDE = r"""#!/bin/sh
 if [ "$1" = auth ] && [ "$2" = status ]; then
-  [ "$CLAUDE_CONFIG_DIR" = "$KEYCHAIN_ACCOUNT" ] && { echo '{"loggedIn":true}'; exit 0; }
+  [ "$CLAUDE_CONFIG_DIR" = "$REVOKED_ACCOUNT" ] && { echo '{"loggedIn":false}'; exit 0; }
+  { [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ] || [ "$CLAUDE_CONFIG_DIR" = "$KEYCHAIN_ACCOUNT" ]; } && { echo '{"loggedIn":true}'; exit 0; }
   echo '{"loggedIn":false}'; exit 0
 fi
 echo "claude $CLAUDE_CONFIG_DIR" >> "$CALLS"
 trap 'echo "claude got TERM" >> "$CALLS"; [ -n "$idle" ] && kill "$idle"; exit 0' TERM
 sid=""; while [ $# -gt 0 ]; do case "$1" in --session-id|--resume) sid="$2";; esac; shift; done
 dir="$CLAUDE_CONFIG_DIR/projects/$(pwd | sed 's/[^A-Za-z0-9]/-/g')"; mkdir -p "$dir"
+if [ "$CLAUDE_CONFIG_DIR" = "$LOGIN_FAILURE" ]; then
+  sleep 1
+  ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  printf '{"type":"assistant","timestamp":"%s","message":{"content":[{"type":"text","text":"Login expired · Please run /login"}]}}\n' "$ts" >> "$dir/$sid.jsonl"
+  [ -n "$HANG" ] && { sleep 600 >/dev/null 2>&1 & idle=$!; wait; }
+fi
 if [ "$CLAUDE_CONFIG_DIR" = "$LIMITED" ]; then
   sleep 1
   ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
@@ -128,6 +135,28 @@ class Runner(unittest.TestCase):
         self.assertEqual([call for call in self.calls_made() if call.startswith("claude")],
                          ["claude a1", "claude a2", "claude a3"])
         self.assertEqual(self.state()["divernote_current"], "claude3")
+
+    def test_revoked_account_with_refresh_token_is_skipped(self):
+        self.run_claude("--session-id", SID, REVOKED_ACCOUNT=str(self.accounts[0]))
+        self.assertEqual(self.calls_made(), ["claude a2"])
+
+    def test_expired_login_ends_idle_run_and_queues_continue(self):
+        elapsed = self.run_claude("--session-id", SID, LOGIN_FAILURE=str(self.accounts[0]), LIMITED="", HANG="1")
+        self.assertLess(elapsed, 20)
+        calls = self.calls_made()
+        self.assertIn("an expired Claude login", calls[1])
+        self.assertEqual(calls[2], "claude got TERM")
+        self.run_claude("--resume", SID, LIMITED="")
+        self.assertEqual(self.calls_made()[-1], "claude a2")
+
+    def test_no_authenticated_account_fails_without_starting_claude(self):
+        for account in self.accounts[:2]:
+            (account / ".credentials.json").unlink()
+        result = subprocess.run([str(RUNNER), str(self.tmp / "fakes" / "claude"), "--session-id", SID],
+                                cwd=self.work, env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No Claude account is logged in", result.stderr)
+        self.assertFalse(self.calls.exists())
 
     def test_an_earlier_limit_in_the_shared_transcript_is_not_blamed_on_this_run(self):
         self.run_claude("--session-id", SID, "--", "hi")

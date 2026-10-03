@@ -56,18 +56,8 @@ def load_selector():
 
 def logged_in(config_dir):
     """An account Claude can run, including credentials stored in the OS keychain."""
-    try:
-        oauth = json.loads((Path(config_dir) / ".credentials.json").read_text()).get("claudeAiOauth") or {}
-    except (OSError, ValueError, AttributeError):
-        oauth = {}
-    if isinstance(oauth.get("refreshToken"), str) and oauth["refreshToken"].strip():
-        return True
-    expires = oauth.get("expiresAt")
-    if isinstance(oauth.get("accessToken"), str) and not isinstance(expires, bool) and isinstance(expires, (int, float)):
-        if (expires / 1000 if expires > 100_000_000_000 else expires) > time.time() + 60:
-            return True
-    # Claude Code on macOS can keep an account's OAuth token in the keychain
-    # without writing .credentials.json. Ask Claude rather than reading secrets.
+    # Stored tokens can be revoked or superseded by the macOS keychain.
+    # Claude's status, not the presence of a refresh token, is authoritative.
     try:
         result = subprocess.run([shutil.which("claude") or "claude", "auth", "status"],
                                 env={**os.environ, "CLAUDE_CONFIG_DIR": config_dir},
@@ -101,8 +91,11 @@ def choose_account(sel):
         if chosen is None:
             # Everything is cooling down: use the one that resets first, so the
             # run fails fast with Claude's own message instead of hanging.
+            authenticated = [a for a in sel.accounts if logged_in(a[1])]
+            if not authenticated:
+                raise RuntimeError("No Claude account is logged in; run /login for an account before restarting the issue.")
             chosen = min(
-                [a for a in sel.accounts if logged_in(a[1])] or sel.accounts,
+                authenticated,
                 key=lambda a: float(st["accounts"].get(a[0], {}).get("cooldown_until", 0) or 0),
             )
         name = chosen[0]
@@ -200,7 +193,7 @@ def limit_in_run(path, offset):
         return None
     found = None
     for line in lines:
-        if "limit" not in line:
+        if "limit" not in line and "Login expired" not in line:
             continue
         try:
             entry = json.loads(line)
@@ -210,7 +203,9 @@ def limit_in_run(path, offset):
         content = (entry.get("message") or {}).get("content")
         text = content if isinstance(content, str) else " ".join(
             part.get("text", "") for part in content or [] if isinstance(part, dict))
-        if entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
+        if entry.get("type") == "assistant" and text.startswith("Login expired"):
+            found = (at + FALLBACK_COOLDOWN, "Login expired", True)
+        elif entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
             found = (reset_time(text, at) or at + FALLBACK_COOLDOWN, text.strip()[:80], True)
         elif entry.get("isMeta") and text.startswith("[Usage limit reached") and found is None:
             found = (at + FALLBACK_COOLDOWN, "usage limit reached", False)
@@ -283,7 +278,7 @@ def on_limit(sel, name, hit, sid, issue_run):
         account["reset_note"] = time.strftime("%m-%d %H:%M", time.localtime(until))
         sel.save_state(st)
         another = any(other != name and eligible(sel, st, other, directory) for other, directory in sel.accounts)
-    log(f"{name} hit a usage limit ({note}); cooling down until {time.strftime('%m-%d %H:%M', time.localtime(until))}")
+    log(f"{name} could not continue ({note}); cooling down until {time.strftime('%m-%d %H:%M', time.localtime(until))}")
     if not another:
         log("no other Claude account has room; the issue stays as it is")
         return
@@ -291,7 +286,9 @@ def on_limit(sel, name, hit, sid, issue_run):
     if issue_run and divernote:
         try:
             result = subprocess.run(
-                [divernote, "pi-message", "--session-id", sid, "--text", CONTINUE_MESSAGE, "--json"],
+                [divernote, "pi-message", "--session-id", sid, "--text",
+                 CONTINUE_MESSAGE.replace("a Claude usage limit", "an expired Claude login")
+                 if note == "Login expired" else CONTINUE_MESSAGE, "--json"],
                 capture_output=True, text=True, timeout=60,
             )
             log(f"continue queued for {sid}: {(result.stdout or result.stderr).strip()[:200]}")
