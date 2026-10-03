@@ -16,9 +16,11 @@ LIMIT = "You've hit your session limit · resets 6:20pm (America/New_York)"
 FAKE_CLAUDE = r"""#!/bin/sh
 if [ "$1" = auth ] && [ "$2" = status ]; then
   [ "$CLAUDE_CONFIG_DIR" = "$REVOKED_ACCOUNT" ] && { echo '{"loggedIn":false}'; exit 0; }
+  [ "$CLAUDE_CONFIG_DIR" = "$FILE_ONLY_ACCOUNT" ] && [ "$CLAUDE_CODE_OAUTH_TOKEN" != x ] && { echo '{"loggedIn":false}'; exit 0; }
   { [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ] || [ "$CLAUDE_CONFIG_DIR" = "$KEYCHAIN_ACCOUNT" ]; } && { echo '{"loggedIn":true}'; exit 0; }
   echo '{"loggedIn":false}'; exit 0
 fi
+[ "$CLAUDE_CONFIG_DIR" = "$FILE_ONLY_ACCOUNT" ] && [ "$CLAUDE_CODE_OAUTH_TOKEN" != x ] && exit 1
 echo "claude $CLAUDE_CONFIG_DIR" >> "$CALLS"
 trap 'echo "claude got TERM" >> "$CALLS"; [ -n "$idle" ] && kill "$idle"; exit 0' TERM
 sid=""; while [ $# -gt 0 ]; do case "$1" in --session-id|--resume) sid="$2";; esac; shift; done
@@ -138,6 +140,23 @@ class Runner(unittest.TestCase):
 
     def test_revoked_account_with_refresh_token_is_skipped(self):
         self.run_claude("--session-id", SID, REVOKED_ACCOUNT=str(self.accounts[0]))
+        self.assertEqual(self.calls_made(), ["claude a2"])
+
+    def test_unexpired_file_credentials_are_passed_to_the_selected_account(self):
+        account = self.accounts[0]
+        (account / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "x", "expiresAt": (time.time() + 3600) * 1000}}))
+        self.run_claude("--session-id", SID, FILE_ONLY_ACCOUNT=str(account), LIMITED="")
+        self.assertEqual(self.calls_made(), ["claude a1"])
+
+    def test_expired_file_credentials_are_not_used_as_a_fallback(self):
+        self.run_claude("--session-id", SID, FILE_ONLY_ACCOUNT=str(self.accounts[0]), LIMITED="")
+        self.assertEqual(self.calls_made(), ["claude a2"])
+
+    def test_revoked_unexpired_file_credentials_are_skipped(self):
+        (self.accounts[0] / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "x", "expiresAt": (time.time() + 3600) * 1000}}))
+        self.run_claude("--session-id", SID, REVOKED_ACCOUNT=str(self.accounts[0]), LIMITED="")
         self.assertEqual(self.calls_made(), ["claude a2"])
 
     def test_expired_login_ends_idle_run_and_queues_continue(self):
