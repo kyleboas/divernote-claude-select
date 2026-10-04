@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -7,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "bin" / "claude-select-run"
@@ -60,7 +62,7 @@ class Runner(unittest.TestCase):
         self.accounts = [self.tmp / name for name in ("a1", "a2", "a3")]
         for account in self.accounts[:2]:
             account.mkdir()
-            (account / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "x", "refreshToken": "r", "expiresAt": 1}}))
+            (account / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "x", "expiresAt": 1}}))
         fakes = self.tmp / "fakes"
         fakes.mkdir()
         for name, body in (("claude", FAKE_CLAUDE), ("divernote", FAKE_DIVERNOTE)):
@@ -138,7 +140,7 @@ class Runner(unittest.TestCase):
                          ["claude a1", "claude a2", "claude a3"])
         self.assertEqual(self.state()["divernote_current"], "claude3")
 
-    def test_revoked_account_with_refresh_token_is_skipped(self):
+    def test_revoked_account_is_skipped(self):
         self.run_claude("--session-id", SID, REVOKED_ACCOUNT=str(self.accounts[0]))
         self.assertEqual(self.calls_made(), ["claude a2"])
 
@@ -148,6 +150,47 @@ class Runner(unittest.TestCase):
             "accessToken": "x", "expiresAt": (time.time() + 3600) * 1000}}))
         self.run_claude("--session-id", SID, FILE_ONLY_ACCOUNT=str(account), LIMITED="")
         self.assertEqual(self.calls_made(), ["claude a1"])
+
+    def test_file_session_is_refreshed_before_being_rejected(self):
+        runner = load_runner()
+        account = self.accounts[0]
+        path = account / ".credentials.json"
+        path.write_text(json.dumps({"other": "preserved", "claudeAiOauth": {
+            "accessToken": "old", "refreshToken": "refresh", "expiresAt": 1,
+            "scopes": ["user:inference"]}}))
+        response = io.BytesIO(json.dumps({"access_token": "new", "refresh_token": "rotated",
+                                         "expires_in": 3600}).encode())
+        checked_envs = []
+        def check_auth(env):
+            checked_envs.append(dict(env))
+            return len(checked_envs) == 2
+        with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "wrong-account"}), \
+                patch.object(runner, "auth_status", side_effect=check_auth), \
+                patch.object(runner.urllib.request, "urlopen", return_value=response) as refresh:
+            env = runner.account_env(str(account))
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "new")
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", checked_envs[0])
+        request = refresh.call_args.args[0]
+        self.assertEqual(request.full_url, "https://platform.claude.com/v1/oauth/token")
+        self.assertEqual(json.loads(request.data)["refresh_token"], "refresh")
+        saved = json.loads(path.read_text())
+        self.assertEqual(saved["other"], "preserved")
+        self.assertEqual(saved["claudeAiOauth"]["refreshToken"], "rotated")
+        self.assertGreater(saved["claudeAiOauth"]["expiresAt"], time.time() * 1000)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        with patch.object(runner.urllib.request, "urlopen") as refresh:
+            self.assertEqual(runner.file_access_token(str(account)), "new")
+            refresh.assert_not_called()
+
+    def test_failed_refresh_preserves_credentials_and_skips_account(self):
+        runner = load_runner()
+        path = self.accounts[0] / ".credentials.json"
+        contents = json.dumps({"claudeAiOauth": {"accessToken": "old", "refreshToken": "r", "expiresAt": 1}})
+        path.write_text(contents)
+        with patch.object(runner, "auth_status", return_value=False), \
+                patch.object(runner.urllib.request, "urlopen", side_effect=runner.urllib.error.URLError("unavailable")):
+            self.assertIsNone(runner.account_env(str(self.accounts[0])))
+        self.assertEqual(path.read_text(), contents)
 
     def test_expired_file_credentials_are_not_used_as_a_fallback(self):
         self.run_claude("--session-id", SID, FILE_ONLY_ACCOUNT=str(self.accounts[0]), LIMITED="")
