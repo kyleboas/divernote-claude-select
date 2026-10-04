@@ -36,6 +36,10 @@ If claude-select is missing, the extension does nothing.
 - Each run uses the current account (`divernote_current` in
   `~/.claude-account-state.json`), as long as it is logged in and not cooling
   down. Otherwise it uses the next account that is.
+- When native Claude auth misses file-backed credentials, the runner uses
+  that account's saved OAuth session. An expired access token is refreshed
+  before rejecting the account. Rotated credentials are saved atomically
+  with owner-only permissions; concurrent issues serialize refreshes.
 - The runner watches the session transcript while Claude runs. When Claude
   says a limit was hit, the account cools down until the reset time Claude
   states. If Claude only warned that the limit is near, the cooldown is one
