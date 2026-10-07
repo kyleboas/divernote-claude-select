@@ -7,10 +7,15 @@ import { fileURLToPath } from 'node:url';
 
 import extension from '../index.mjs';
 
-function hook() {
+function registered() {
   let handler;
-  extension({ on: (name, fn) => { assert.equal(name, 'agent-launch'); handler = fn; } });
-  return handler;
+  const commands = {};
+  extension({ on: (name, fn) => { assert.equal(name, 'agent-launch'); handler = fn; }, registerCommand: (name, fn) => { commands[name] = fn; } });
+  return { handler, commands };
+}
+
+function hook() {
+  return registered().handler;
 }
 
 test('Claude launches run through claude-select-run; Pi launches are unchanged', async t => {
@@ -25,4 +30,13 @@ test('Claude launches run through claude-select-run; Pi launches are unchanged',
   assert.equal(result.env.DIVERNOTE_LAUNCH_PURPOSE, 'issue');
   assert.equal(await hook()({ ...launch, agent: 'pi' }), undefined);
   assert.equal(await hook()({ ...launch, env: { HOME: home, CLAUDE_SELECT_PATH: join(home, 'missing') } }), undefined);
+});
+
+test('newsub reports that it cannot switch without claude-select', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dcs-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let written = '';
+  const code = await registered().commands.newsub({ argv: ['--json'], env: { HOME: home, CLAUDE_SELECT_PATH: join(home, 'missing') }, stdout: text => { written += text; }, stderr: () => {} });
+  assert.equal(code, 1);
+  assert.deepEqual(JSON.parse(written), { status: 'unavailable', detail: 'claude-select is not installed.' });
 });
