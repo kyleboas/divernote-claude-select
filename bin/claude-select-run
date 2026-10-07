@@ -6,6 +6,12 @@ index.mjs starts Divernote's Claude runs through this as
 claude-select account; when a run hits a usage limit, that
 account is put in cooldown until its reset time, the next logged-in account
 becomes current, and the interrupted Divernote issue is told to continue.
+A Claude terminal the user opened on the issue is reopened on the next
+account instead, in the same terminal.
+
+`claude-select-run --newsub` is Divernote's /newsub: it makes the next account
+with room current, without cooling the old one down, and prints the result
+as JSON.
 
 Accounts, cooldowns and the state lock are claude-select's own
 (~/.claude-account-state.json), so claude-select's menu shows the same view.
@@ -40,6 +46,13 @@ CONTINUE_MESSAGE = (
     # A resumed run gets none of Divernote's instructions, so the finish is spelled out.
     "If it changes code, finish by committing it, pushing the issue branch and opening a pull request, then report the result."
 )
+# What a reopened terminal is sent; the user is there to drive the rest.
+TERMINAL_CONTINUE = (
+    "Your last turn was cut off by a Claude usage limit, and this session has moved to another "
+    "Claude account. Continue where you left off; do not repeat work that is already complete."
+)
+# How long a terminal shows Claude's limit message before it is reopened.
+TERMINAL_PAUSE = 2
 
 
 def log(text):
@@ -181,6 +194,41 @@ def choose_account(sel):
     return chosen
 
 
+def cooldown(st, name):
+    try:
+        return float(st["accounts"].get(name, {}).get("cooldown_until", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def next_account(sel):
+    """/newsub: make the next account after the current one that has room current.
+
+    The account it leaves is not cooled down: it may still have room, and a
+    limit it did hit was already recorded when its run saw it.
+    """
+    with sel.state_lock():
+        st = sel.load_state()
+        names = [name for name, _ in sel.accounts]
+        current = st.get("divernote_current")
+        start = names.index(current) if current in names else -1
+        for offset in range(1, len(sel.accounts) + 1):
+            name, config_dir = sel.accounts[(start + offset) % len(sel.accounts)]
+            if name != current and eligible(sel, st, name, config_dir):
+                st["divernote_current"] = name
+                sel.save_state(st)
+                log(f"/newsub: switching from {current or 'no account'} to {name}")
+                return {"status": "switched", "from": current, "account": name}
+        cooling = [(cooldown(st, name), name) for name in names if name != current and cooldown(st, name) > time.time()]
+    if cooling:
+        until, name = min(cooling)
+        detail = f"No other Claude account has room. {name} resets at {time.strftime('%H:%M', time.localtime(until))}."
+    else:
+        detail = "No other Claude account is logged in."
+    log(f"/newsub: {detail}")
+    return {"status": "unavailable", "from": current, "detail": detail}
+
+
 def trust_folder(config_dir, cwd):
     """Divernote trusts the issue folder for its own account; do the same for this one."""
     path = Path(config_dir) / ".claude.json"
@@ -285,7 +333,40 @@ def limit_in_run(path, offset):
     return found
 
 
+def newsub():
+    try:
+        sel = load_selector()
+    except Exception as error:
+        result = {"status": "unavailable", "detail": f"claude-select is unavailable ({error})."}
+    else:
+        result = next_account(sel)
+    print(json.dumps(result))
+    return 0 if result["status"] == "switched" else 1
+
+
+def reopened(args, sid):
+    """A terminal's command line to resume its session with the continue message."""
+    head = args[:args.index("--")] if "--" in args else list(args)
+    if "--session-id" in head:
+        head[head.index("--session-id")] = "--resume"
+    elif "--resume" not in head:
+        head += ["--resume", sid]
+    return [*head, "--", TERMINAL_CONTINUE]
+
+
+def stop(child):
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
 def main():
+    if sys.argv[1:2] == ["--newsub"]:
+        return newsub()
     if len(sys.argv) < 2:
         print("usage: claude-select-run <claude> [args...]", file=sys.stderr)
         return 2
@@ -299,52 +380,65 @@ def main():
         log(f"claude-select unavailable ({error}); running claude unchanged")
         os.execvp(claude, [claude, *args])
     sel.ensure_shared_resume_history()
-    name, config_dir = choose_account(sel)
     cwd = os.getcwd()
-    trust_folder(config_dir, cwd)
-    env = account_env(config_dir)
-    if env is None:
-        raise RuntimeError("Selected Claude account is no longer authenticated.")
     sid = session_id(args)
-    transcript = transcript_path(config_dir, cwd, sid) if sid else None
-    offset = transcript_size(transcript) if transcript else 0
-    child = subprocess.Popen([claude, *args], env=env)
+    running = {"child": None}
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(signum, lambda number, _frame: child.poll() is None and child.send_signal(number))
-    # Only Divernote's own issue runs are continued or ended; a terminal the
-    # user opened on the session is theirs to drive.
-    handled = threading.Event()
+        signal.signal(signum, lambda number, _frame: running["child"] and running["child"].poll() is None and running["child"].send_signal(number))
+    # Each account gets at most one try, so a terminal is never reopened forever.
+    for _ in range(len(sel.accounts)):
+        name, config_dir = choose_account(sel)
+        trust_folder(config_dir, cwd)
+        env = account_env(config_dir)
+        if env is None:
+            raise RuntimeError("Selected Claude account is no longer authenticated.")
+        transcript = transcript_path(config_dir, cwd, sid) if sid else None
+        offset = transcript_size(transcript) if transcript else 0
+        child = running["child"] = subprocess.Popen([claude, *args], env=env)
+        handled = threading.Event()
+        reopen = threading.Event()
 
-    def watch():
-        # After a hard limit Claude sits idle and never ends the turn, so
-        # Divernote would wait out its two-hour timeout.
-        while child.poll() is None and transcript:
+        def watch():
+            # After a hard limit Claude sits idle and never ends the turn, so
+            # Divernote would wait out its two-hour timeout. An issue run is
+            # ended for the worker to continue; a terminal the user opened is
+            # reopened on the next account, in the same terminal.
+            while child.poll() is None and transcript:
+                hit = limit_in_run(transcript, offset)
+                if hit and hit[2]:
+                    handled.set()
+                    another = on_limit(sel, name, hit, sid, issue_run)
+                    if issue_run:
+                        stop(child)
+                    elif another and child.poll() is None:
+                        time.sleep(TERMINAL_PAUSE)
+                        reopen.set()
+                        stop(child)
+                    return
+                time.sleep(2)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        code = child.wait()
+        watcher.join(timeout=70)
+        if not handled.is_set() and transcript:
             hit = limit_in_run(transcript, offset)
-            if hit and hit[2]:
-                handled.set()
+            if hit:
                 on_limit(sel, name, hit, sid, issue_run)
-                if issue_run and child.poll() is None:
-                    child.terminate()
-                    try:
-                        child.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        child.kill()
-                return
-            time.sleep(2)
-
-    watcher = threading.Thread(target=watch, daemon=True)
-    watcher.start()
-    code = child.wait()
-    watcher.join(timeout=70)
-    if not handled.is_set() and transcript:
-        hit = limit_in_run(transcript, offset)
-        if hit:
-            on_limit(sel, name, hit, sid, issue_run)
+        if not reopen.is_set():
+            return code
+        args = reopened(args, sid)
+        log(f"reopening the terminal for {sid} on the next account")
+        sys.stdout.write("\r\n[divernote] This Claude account hit its limit. Continuing on the next account...\r\n")
+        sys.stdout.flush()
     return code
 
 
 def on_limit(sel, name, hit, sid, issue_run):
-    """Cool the account down and, when another has room, tell the issue to continue."""
+    """Cool the account down and, when another has room, tell the issue to continue.
+
+    Returns whether another account has room.
+    """
     until, note, _ = hit
     with sel.state_lock():
         st = sel.load_state()
@@ -356,7 +450,7 @@ def on_limit(sel, name, hit, sid, issue_run):
     log(f"{name} could not continue ({note}); cooling down until {time.strftime('%m-%d %H:%M', time.localtime(until))}")
     if not another:
         log("no other Claude account has room; the issue stays as it is")
-        return
+        return False
     divernote = shutil.which("divernote")
     if issue_run and divernote:
         try:
@@ -369,6 +463,7 @@ def on_limit(sel, name, hit, sid, issue_run):
             log(f"continue queued for {sid}: {(result.stdout or result.stderr).strip()[:200]}")
         except (OSError, subprocess.TimeoutExpired) as error:
             log(f"could not queue continue for {sid}: {error}")
+    return True
 
 
 if __name__ == "__main__":

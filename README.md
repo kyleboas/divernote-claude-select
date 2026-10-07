@@ -19,7 +19,8 @@ it starts. To remove the extension, delete the folder and restart the worker.
 
 ## Requirements
 
-- Divernote with the `agent-launch` extension hook.
+- Divernote with the `agent-launch` extension hook. `/newsub` also needs a
+  Divernote that offers extension commands on an issue.
 - `claude-select` at `~/.local/bin/claude-select`, or at `CLAUDE_SELECT_PATH`.
   Accounts are claude-select's (`~/.claude-account1`…`4`, or
   `CLAUDE_SELECT_ACCOUNTS`), and each account's `projects` folder links to the
@@ -48,8 +49,18 @@ If claude-select is missing, the extension does nothing.
   (`divernote pi-message`). It then ends a run that Claude left idle at a
   hard limit, so Divernote does not wait out its two-hour timeout. The next
   run resumes the same session on the next account.
-- A Claude terminal you open on an issue is never ended or continued. Only
-  its account is put in cooldown.
+- A Claude terminal you open on an issue that Claude leaves idle at a hard
+  limit is reopened in place on the next account with room. It resumes the
+  same session and is told to continue. If no other account has room, or you
+  quit Claude yourself, the terminal is left alone and only its account is put
+  in cooldown.
+- `/newsub` on a Claude Code issue in Divernote (or `divernote newsub`)
+  makes the next account with room current, without cooling the old one
+  down. Divernote then continues the issue there: a running issue restarts
+  on the same session, and any other issue is sent the message typed after
+  `/newsub`, or a continue message. If no other account has room, it says
+  which one resets first and changes nothing. It needs a Divernote with
+  `/newsub`.
 - If every account is cooling down, the run uses the account that resets
   first, and nothing is queued.
 - Log: `rotate.log` in this folder.

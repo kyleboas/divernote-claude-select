@@ -119,10 +119,65 @@ class Runner(unittest.TestCase):
         self.assertTrue(calls[1].startswith("divernote pi-message"))
         self.assertEqual(calls[2], "claude got TERM")
 
-    def test_a_terminal_the_user_opened_is_neither_continued_nor_ended(self):
+    def test_a_terminal_the_user_left_after_a_limit_is_not_reopened(self):
         self.run_claude("--resume", SID, purpose="terminal")
         self.assertEqual(self.calls_made(), ["claude a1"])
         self.assertGreater(self.state()["accounts"]["claude1"]["cooldown_until"], time.time())
+
+    def test_a_terminal_left_idle_at_a_limit_is_reopened_on_the_next_account(self):
+        args_log = self.tmp / "args.log"
+        fake = self.tmp / "fakes" / "claude"
+        fake.write_text(FAKE_CLAUDE.replace('echo "claude $CLAUDE_CONFIG_DIR" >> "$CALLS"',
+                                            'echo "claude $CLAUDE_CONFIG_DIR" >> "$CALLS"; echo "$*" >> "$ARGS_LOG"'))
+        self.run_claude("--resume", SID, "--permission-mode", "bypassPermissions", purpose="terminal", HANG="1", ARGS_LOG=str(args_log))
+        self.assertEqual(self.calls_made(), ["claude a1", "claude got TERM", "claude a2"])
+        reopened = args_log.read_text().splitlines()[1]
+        self.assertTrue(reopened.startswith(f"--resume {SID} --permission-mode bypassPermissions -- Your last turn was cut off"))
+        self.assertEqual(self.state()["divernote_current"], "claude2")
+
+    def test_a_terminal_is_not_reopened_when_no_other_account_has_room(self):
+        (self.accounts[1] / ".credentials.json").unlink()
+        self.env["HANG"] = "1"
+        proc = subprocess.Popen([str(RUNNER), str(self.tmp / "fakes" / "claude"), "--resume", SID], cwd=self.work,
+                                env={**self.env, "DIVERNOTE_LAUNCH_PURPOSE": "terminal"})
+        time.sleep(6)
+        self.assertIsNone(proc.poll(), "the user's terminal stays open")
+        proc.terminate()
+        proc.wait(timeout=20)
+        self.assertEqual(self.calls_made()[0], "claude a1")
+        self.assertNotIn("claude a2", self.calls_made())
+
+    def newsub(self):
+        result = subprocess.run([str(RUNNER), "--newsub"], env=self.env, capture_output=True, text=True, timeout=60)
+        return result.returncode, json.loads(result.stdout)
+
+    def test_newsub_moves_to_the_next_account_without_cooling_the_old_one(self):
+        self.run_claude("--session-id", SID, "--", "hi", LIMITED="")
+        self.assertEqual(self.state()["divernote_current"], "claude1")
+        code, result = self.newsub()
+        self.assertEqual((code, result), (0, {"status": "switched", "from": "claude1", "account": "claude2"}))
+        state = self.state()
+        self.assertEqual(state["divernote_current"], "claude2")
+        self.assertEqual(state["accounts"]["claude1"]["cooldown_until"], 0)
+        # It wraps around, skipping accounts that are not logged in.
+        self.assertEqual(self.newsub(), (0, {"status": "switched", "from": "claude2", "account": "claude1"}))
+        self.run_claude("--resume", SID, "--", "go", LIMITED="")
+        self.assertEqual(self.calls_made()[-1], "claude a1")
+
+    def test_newsub_says_when_the_first_other_account_resets(self):
+        self.run_claude("--session-id", SID, "--", "hi", LIMITED="")
+        state = self.state()
+        state["accounts"]["claude2"]["cooldown_until"] = time.time() + 3600
+        (self.tmp / "state.json").write_text(json.dumps(state))
+        code, result = self.newsub()
+        self.assertEqual(code, 1)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertRegex(result["detail"], r"^No other Claude account has room\. claude2 resets at \d\d:\d\d\.$")
+        self.assertEqual(self.state()["divernote_current"], "claude1")
+        (self.accounts[1] / ".credentials.json").unlink()
+        state["accounts"]["claude2"]["cooldown_until"] = 0
+        (self.tmp / "state.json").write_text(json.dumps(state))
+        self.assertEqual(self.newsub()[1]["detail"], "No other Claude account is logged in.")
 
     def test_nothing_is_queued_when_no_other_account_has_room(self):
         (self.accounts[1] / ".credentials.json").unlink()
