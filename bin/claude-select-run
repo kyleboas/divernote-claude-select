@@ -364,9 +364,22 @@ def on_limit(sel, name, hit, sid, issue_run):
                 [divernote, "pi-message", "--session-id", sid, "--text",
                  CONTINUE_MESSAGE.replace("a Claude usage limit", "an expired Claude login")
                  if note == "Login expired" else CONTINUE_MESSAGE, "--json"],
-                capture_output=True, text=True, timeout=60,
+                # Divernote stops the issue's whole PTY process group after a
+                # quota error. Delivery must finish outside that dying group.
+                start_new_session=True, capture_output=True, text=True, timeout=60,
             )
-            log(f"continue queued for {sid}: {(result.stdout or result.stderr).strip()[:200]}")
+            detail = (result.stdout or result.stderr).strip()[:200]
+            if result.returncode != 0:
+                log(f"could not queue continue for {sid}: exit {result.returncode}: {detail}")
+                return
+            try:
+                receipt = json.loads(result.stdout)
+            except (ValueError, TypeError):
+                receipt = None
+            if not isinstance(receipt, dict) or receipt.get("status") not in ("queue", "starting", "later"):
+                log(f"could not confirm continue for {sid}: {detail}")
+                return
+            log(f"continue queued for {sid}: {detail}")
         except (OSError, subprocess.TimeoutExpired) as error:
             log(f"could not queue continue for {sid}: {error}")
 
