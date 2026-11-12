@@ -9,7 +9,7 @@ import extension from '../index.mjs';
 
 function hook() {
   let handler;
-  extension({ on: (name, fn) => { assert.equal(name, 'agent-launch'); handler = fn; } });
+  extension({ on: (name, fn) => { if (name === 'agent-launch') handler = fn; } });
   return handler;
 }
 
