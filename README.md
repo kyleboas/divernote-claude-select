@@ -52,6 +52,13 @@ If claude-select is missing, the extension does nothing.
   its account is put in cooldown.
 - If every account is cooling down, the run uses the account that resets
   first, and nothing is queued.
+- Status shows each account's usage: a `status-usage` hook reads every
+  account's existing login (Keychain first on macOS, then
+  `.credentials.json`) and reports its 5-hour and weekly limits as
+  `claude1`…`claude4`, marking the account in use and any cooling down. It
+  never refreshes a token or writes credentials or state. Results are cached
+  for a minute. Needs a Divernote whose Status accepts more than four Usage
+  reports.
 - Log: `rotate.log` in this folder.
 
 ## Tests
