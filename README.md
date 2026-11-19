@@ -44,14 +44,19 @@ If claude-select is missing, the extension does nothing.
   says a limit was hit, the account cools down until the reset time Claude
   states. If Claude only warned that the limit is near, the cooldown is one
   hour. claude-select's menu shows the same cooldowns.
-- If another account has room, the runner tells the issue to continue
-  (`divernote pi-message`). It then ends a run that Claude left idle at a
-  hard limit, so Divernote does not wait out its two-hour timeout. The next
-  run resumes the same session on the next account.
+- The runner tells the issue to continue (`divernote pi-message`), even if
+  every logged-in account is cooling down. It then ends a run that Claude
+  left idle at a hard limit. The next run resumes the same session when an
+  account has room; it can reuse the same account after its reset.
 - A Claude terminal you open on an issue is never ended or continued. Only
   its account is put in cooldown.
-- If every account is cooling down, the run uses the account that resets
-  first, and nothing is queued.
+- If every account is cooling down, the launch waits for the earliest reset
+  among logged-in accounts. Issue launches wait before the PTY starts, so
+  the wait does not consume Divernote's two-hour run timeout. The account
+  lock is released while waiting; state and login status are checked again
+  at least every 30 seconds. A changed reset time changes the wait.
+- If no account is logged in, the runner reports a login error instead of
+  waiting forever. Waiting does not count as an account run.
 - Status shows each account's usage: a `status-usage` hook reads every
   account's existing login (Keychain first on macOS, then
   `.credentials.json`) and reports its 5-hour and weekly limits as
