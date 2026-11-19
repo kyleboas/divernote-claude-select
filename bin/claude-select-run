@@ -276,7 +276,7 @@ def limit_in_run(path, offset):
         return None
     found = None
     for line in lines:
-        if "limit" not in line and "Login expired" not in line:
+        if "limit" not in line and "Login expired" not in line and "authentication_failed" not in line:
             continue
         try:
             entry = json.loads(line)
@@ -286,7 +286,12 @@ def limit_in_run(path, offset):
         content = (entry.get("message") or {}).get("content")
         text = content if isinstance(content, str) else " ".join(
             part.get("text", "") for part in content or [] if isinstance(part, dict))
-        if entry.get("type") == "assistant" and text.startswith("Login expired"):
+        # Both mean this account's login is dead: "Login expired" from the
+        # client, or authentication_failed when the login reached its time
+        # limit and cannot be renewed. Move on until the account signs in again.
+        if entry.get("type") == "assistant" and (
+                text.startswith("Login expired")
+                or (entry.get("isApiErrorMessage") and entry.get("error") == "authentication_failed")):
             found = (at + FALLBACK_COOLDOWN, "Login expired", True)
         elif entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
             found = (reset_time(text, at) or at + FALLBACK_COOLDOWN, text.strip()[:80], True)

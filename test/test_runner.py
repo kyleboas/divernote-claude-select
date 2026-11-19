@@ -35,6 +35,12 @@ if [ "$CLAUDE_CONFIG_DIR" = "$LOGIN_FAILURE" ]; then
   printf '{"type":"assistant","timestamp":"%s","message":{"content":[{"type":"text","text":"Login expired · Please run /login"}]}}\n' "$ts" >> "$dir/$sid.jsonl"
   [ -n "$HANG" ] && { sleep 600 >/dev/null 2>&1 & idle=$!; wait; }
 fi
+if [ "$CLAUDE_CONFIG_DIR" = "$AUTH_FAILURE" ]; then
+  sleep 1
+  ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  printf '{"type":"assistant","timestamp":"%s","isApiErrorMessage":true,"error":"authentication_failed","message":{"content":[{"type":"text","text":"Failed to authenticate: this login reached its time limit and cannot be renewed."}]}}\n' "$ts" >> "$dir/$sid.jsonl"
+  [ -n "$HANG" ] && { sleep 600 >/dev/null 2>&1 & idle=$!; wait; }
+fi
 if [ "$CLAUDE_CONFIG_DIR" = "$LIMITED" ]; then
   sleep 1
   ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
@@ -238,6 +244,16 @@ class Runner(unittest.TestCase):
         calls = self.calls_made()
         self.assertIn("an expired Claude login", calls[1])
         self.assertEqual(calls[2], "claude got TERM")
+        self.run_claude("--resume", SID, LIMITED="")
+        self.assertEqual(self.calls_made()[-1], "claude a2")
+
+    def test_login_past_its_time_limit_rotates_to_the_next_account(self):
+        elapsed = self.run_claude("--session-id", SID, AUTH_FAILURE=str(self.accounts[0]), LIMITED="", HANG="1")
+        self.assertLess(elapsed, 20)
+        calls = self.calls_made()
+        self.assertIn("an expired Claude login", calls[1])
+        self.assertEqual(calls[2], "claude got TERM")
+        self.assertGreater(self.state()["accounts"]["claude1"]["cooldown_until"], time.time())
         self.run_claude("--resume", SID, LIMITED="")
         self.assertEqual(self.calls_made()[-1], "claude a2")
 
