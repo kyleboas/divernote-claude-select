@@ -7,8 +7,10 @@ import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "bin" / "claude-select-run"
@@ -31,6 +33,12 @@ if [ "$CLAUDE_CONFIG_DIR" = "$LOGIN_FAILURE" ]; then
   sleep 1
   ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
   printf '{"type":"assistant","timestamp":"%s","message":{"content":[{"type":"text","text":"Login expired · Please run /login"}]}}\n' "$ts" >> "$dir/$sid.jsonl"
+  [ -n "$HANG" ] && { sleep 600 >/dev/null 2>&1 & idle=$!; wait; }
+fi
+if [ "$CLAUDE_CONFIG_DIR" = "$AUTH_FAILURE" ]; then
+  sleep 1
+  ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  printf '{"type":"assistant","timestamp":"%s","isApiErrorMessage":true,"error":"authentication_failed","message":{"content":[{"type":"text","text":"Failed to authenticate: this login reached its time limit and cannot be renewed."}]}}\n' "$ts" >> "$dir/$sid.jsonl"
   [ -n "$HANG" ] && { sleep 600 >/dev/null 2>&1 & idle=$!; wait; }
 fi
 if [ "$CLAUDE_CONFIG_DIR" = "$LIMITED" ]; then
@@ -124,10 +132,38 @@ class Runner(unittest.TestCase):
         self.assertEqual(self.calls_made(), ["claude a1"])
         self.assertGreater(self.state()["accounts"]["claude1"]["cooldown_until"], time.time())
 
-    def test_nothing_is_queued_when_no_other_account_has_room(self):
+    def test_continue_is_queued_when_only_the_limited_account_is_logged_in(self):
         (self.accounts[1] / ".credentials.json").unlink()
-        self.run_claude("--session-id", SID, "--", "hi")
-        self.assertEqual(self.calls_made(), ["claude a1"])
+        self.run_claude("--session-id", SID, "--", "hi", HANG="1")
+        calls = self.calls_made()
+        self.assertEqual(calls[0], "claude a1")
+        self.assertTrue(calls[1].startswith(f"divernote pi-message --session-id {SID}"))
+        self.assertEqual(calls[2], "claude got TERM")
+
+    def test_exhausted_accounts_wait_then_launch_the_earliest_reset(self):
+        now = time.time()
+        (self.tmp / "state.json").write_text(json.dumps({
+            "divernote_current": "claude1",
+            "accounts": {
+                "claude1": {"cooldown_until": now + 3600},
+                "claude2": {"cooldown_until": now + 2},
+            },
+        }))
+        elapsed = self.run_claude("--resume", SID, LIMITED="")
+        self.assertGreaterEqual(elapsed, 1.5)
+        self.assertEqual(self.calls_made(), ["claude a2"])
+        self.assertEqual(self.state()["accounts"]["claude2"]["runs"], 1)
+
+    def test_preflight_waits_without_recording_or_launching(self):
+        now = time.time()
+        state = {"accounts": {f"claude{i + 1}": {"cooldown_until": now + 2} for i in range(2)}}
+        path = self.tmp / "state.json"
+        path.write_text(json.dumps(state))
+        started = time.time()
+        subprocess.run([str(RUNNER), "--wait-for-account"], env=self.env, check=True, timeout=10)
+        self.assertGreaterEqual(time.time() - started, 1.5)
+        self.assertEqual(json.loads(path.read_text()), state)
+        self.assertFalse(self.calls.exists())
 
     def test_keychain_only_account_is_selected_after_file_backed_accounts_cool_down(self):
         self.accounts[2].mkdir()
@@ -211,6 +247,16 @@ class Runner(unittest.TestCase):
         self.run_claude("--resume", SID, LIMITED="")
         self.assertEqual(self.calls_made()[-1], "claude a2")
 
+    def test_login_past_its_time_limit_rotates_to_the_next_account(self):
+        elapsed = self.run_claude("--session-id", SID, AUTH_FAILURE=str(self.accounts[0]), LIMITED="", HANG="1")
+        self.assertLess(elapsed, 20)
+        calls = self.calls_made()
+        self.assertIn("an expired Claude login", calls[1])
+        self.assertEqual(calls[2], "claude got TERM")
+        self.assertGreater(self.state()["accounts"]["claude1"]["cooldown_until"], time.time())
+        self.run_claude("--resume", SID, LIMITED="")
+        self.assertEqual(self.calls_made()[-1], "claude a2")
+
     def test_no_authenticated_account_fails_without_starting_claude(self):
         for account in self.accounts[:2]:
             (account / ".credentials.json").unlink()
@@ -226,6 +272,79 @@ class Runner(unittest.TestCase):
         self.run_claude("--resume", SID, "--", "again")
         self.assertEqual([call for call in self.calls_made() if call.startswith("claude")], ["claude a1", "claude a2", "claude a2"])
         self.assertEqual(self.state()["accounts"]["claude2"]["cooldown_until"], 0)
+
+
+class Waiting(unittest.TestCase):
+    def setUp(self):
+        self.runner = load_runner()
+        self.now = 1000
+        self.locked = False
+        self.state = {"divernote_current": "a", "accounts": {
+            "a": {"cooldown_until": self.now + 12_000, "runs": 4},
+            "b": {"cooldown_until": self.now + 9_000, "runs": 2},
+            "revoked": {"cooldown_until": self.now + 1, "runs": 0},
+        }}
+        @contextmanager
+        def lock():
+            self.assertFalse(self.locked)
+            self.locked = True
+            try:
+                yield
+            finally:
+                self.locked = False
+        self.sel = SimpleNamespace(accounts=[(name, name) for name in self.state["accounts"]],
+                                   state_lock=lock, load_state=lambda: self.state, save_state=Mock())
+        for patcher in (patch.object(self.runner, "logged_in", side_effect=lambda directory: directory != "revoked"),
+                        patch.object(self.runner.time, "time", side_effect=lambda: self.now),
+                        patch.object(self.runner, "log"), patch("sys.stderr", new_callable=io.StringIO)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def sleep(self, seconds):
+        self.assertFalse(self.locked, "waiting must release the shared account lock")
+        self.assertGreater(seconds, 0)
+        self.assertLessEqual(seconds, 30)
+        self.assertEqual(self.state["accounts"]["b"]["runs"], 2)
+        self.now += seconds
+
+    def test_waits_longer_than_two_hours_and_records_only_once(self):
+        with patch.object(self.runner.time, "sleep", side_effect=self.sleep):
+            self.assertEqual(self.runner.choose_account(self.sel), ("b", "b"))
+        self.assertEqual(self.now, 10_000)
+        self.assertEqual(self.state["accounts"]["b"]["runs"], 3)
+        self.sel.save_state.assert_called_once()
+
+    def test_rechecks_an_extended_reset_and_uses_the_new_earliest_account(self):
+        def sleep(seconds):
+            self.sleep(seconds)
+            self.state["accounts"]["b"]["cooldown_until"] = 20_000
+        with patch.object(self.runner.time, "sleep", side_effect=sleep):
+            self.assertEqual(self.runner.choose_account(self.sel), ("a", "a"))
+        self.assertEqual(self.now, 13_000)
+
+    def test_cleared_cooldown_is_seen_on_the_next_poll(self):
+        def sleep(seconds):
+            self.sleep(seconds)
+            self.state["accounts"]["a"]["cooldown_until"] = 0
+        with patch.object(self.runner.time, "sleep", side_effect=sleep):
+            self.assertEqual(self.runner.choose_account(self.sel), ("a", "a"))
+        self.assertEqual(self.now, 1030)
+
+    def test_losing_auth_while_waiting_fails_without_recording(self):
+        def sleep(seconds):
+            self.sleep(seconds)
+            self.runner.logged_in.side_effect = lambda directory: False
+        with patch.object(self.runner.time, "sleep", side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError, "No Claude account is logged in"):
+                self.runner.choose_account(self.sel)
+        self.sel.save_state.assert_not_called()
+
+    def test_interruption_does_not_record_a_launch(self):
+        with patch.object(self.runner.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runner.choose_account(self.sel)
+        self.assertFalse(self.locked)
+        self.sel.save_state.assert_not_called()
 
 
 class ResetTime(unittest.TestCase):

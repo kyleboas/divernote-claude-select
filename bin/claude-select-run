@@ -35,8 +35,8 @@ SELECTOR = Path(os.environ.get("CLAUDE_SELECT_PATH", Path.home() / ".local" / "b
 # Cooldown when Claude only warns that a limit is near and gives no reset time.
 FALLBACK_COOLDOWN = 60 * 60
 CONTINUE_MESSAGE = (
-    "Your last turn was cut off by a Claude usage limit, and this issue has moved to another "
-    "Claude account. Continue the task you were working on; do not repeat work that is already complete. "
+    "Your last turn was cut off by a Claude usage limit. A Claude account is now available. "
+    "Continue the task you were working on; do not repeat work that is already complete. "
     # A resumed run gets none of Divernote's instructions, so the finish is spelled out.
     "If it changes code, finish by committing it, pushing the issue branch and opening a pull request, then report the result."
 )
@@ -148,37 +148,47 @@ def eligible(sel, st, name, config_dir):
     return not cooling and logged_in(config_dir)
 
 
-def choose_account(sel):
-    """The current account while it has room, else the next one in order that does."""
-    with sel.state_lock():
-        st = sel.load_state()
-        names = [name for name, _ in sel.accounts]
-        current = st.get("divernote_current")
-        start = names.index(current) if current in names else 0
-        chosen = None
-        for offset in range(len(sel.accounts)):
-            name, config_dir = sel.accounts[(start + offset) % len(sel.accounts)]
-            if eligible(sel, st, name, config_dir):
-                chosen = (name, config_dir)
-                break
-        if chosen is None:
-            # Everything is cooling down: use the one that resets first, so the
-            # run fails fast with Claude's own message instead of hanging.
+def choose_account(sel, record=True):
+    """Use an available account, waiting for the earliest reset if necessary."""
+    waiting_for = None
+    while True:
+        with sel.state_lock():
+            st = sel.load_state()
+            names = [name for name, _ in sel.accounts]
+            current = st.get("divernote_current")
+            start = names.index(current) if current in names else 0
+            chosen = None
+            for offset in range(len(sel.accounts)):
+                name, config_dir = sel.accounts[(start + offset) % len(sel.accounts)]
+                if eligible(sel, st, name, config_dir):
+                    chosen = (name, config_dir)
+                    break
+            if chosen is not None:
+                if record:
+                    name = chosen[0]
+                    if st.get("divernote_current") != name:
+                        log(f"switching to {name}")
+                    st["divernote_current"] = name
+                    st["accounts"][name]["runs"] = st["accounts"][name].get("runs", 0) + 1
+                    st["accounts"][name]["last_used"] = time.time()
+                    sel.save_state(st)
+                return chosen
             authenticated = [a for a in sel.accounts if logged_in(a[1])]
             if not authenticated:
                 raise RuntimeError("No Claude account is logged in; run /login for an account before restarting the issue.")
-            chosen = min(
+            name, _ = min(
                 authenticated,
                 key=lambda a: float(st["accounts"].get(a[0], {}).get("cooldown_until", 0) or 0),
             )
-        name = chosen[0]
-        if st.get("divernote_current") != name:
-            log(f"switching to {name}")
-        st["divernote_current"] = name
-        st["accounts"][name]["runs"] = st["accounts"][name].get("runs", 0) + 1
-        st["accounts"][name]["last_used"] = time.time()
-        sel.save_state(st)
-    return chosen
+            until = float(st["accounts"][name].get("cooldown_until", 0) or 0)
+        # Never hold claude-select's shared lock while waiting. Re-read state
+        # and auth periodically: another run can extend or clear a cooldown.
+        if waiting_for != (name, until):
+            message = f"All Claude accounts are cooling down; waiting for {name} until {time.strftime('%m-%d %H:%M:%S', time.localtime(until))}"
+            log(message)
+            print(message, file=sys.stderr, flush=True)
+            waiting_for = (name, until)
+        time.sleep(min(30, max(0.1, until - time.time())))
 
 
 def trust_folder(config_dir, cwd):
@@ -266,7 +276,7 @@ def limit_in_run(path, offset):
         return None
     found = None
     for line in lines:
-        if "limit" not in line and "Login expired" not in line:
+        if "limit" not in line and "Login expired" not in line and "authentication_failed" not in line:
             continue
         try:
             entry = json.loads(line)
@@ -276,7 +286,12 @@ def limit_in_run(path, offset):
         content = (entry.get("message") or {}).get("content")
         text = content if isinstance(content, str) else " ".join(
             part.get("text", "") for part in content or [] if isinstance(part, dict))
-        if entry.get("type") == "assistant" and text.startswith("Login expired"):
+        # Both mean this account's login is dead: "Login expired" from the
+        # client, or authentication_failed when the login reached its time
+        # limit and cannot be renewed. Move on until the account signs in again.
+        if entry.get("type") == "assistant" and (
+                text.startswith("Login expired")
+                or (entry.get("isApiErrorMessage") and entry.get("error") == "authentication_failed")):
             found = (at + FALLBACK_COOLDOWN, "Login expired", True)
         elif entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
             found = (reset_time(text, at) or at + FALLBACK_COOLDOWN, text.strip()[:80], True)
@@ -286,6 +301,11 @@ def limit_in_run(path, offset):
 
 
 def main():
+    if sys.argv[1:] == ["--wait-for-account"]:
+        # The extension does this before Divernote starts its run timeout.
+        # Do not count a preflight as a launch or change the current account.
+        choose_account(load_selector(), record=False)
+        return 0
     if len(sys.argv) < 2:
         print("usage: claude-select-run <claude> [args...]", file=sys.stderr)
         return 2
@@ -344,7 +364,7 @@ def main():
 
 
 def on_limit(sel, name, hit, sid, issue_run):
-    """Cool the account down and, when another has room, tell the issue to continue."""
+    """Cool the account down and queue a continuation, even if it must wait."""
     until, note, _ = hit
     with sel.state_lock():
         st = sel.load_state()
@@ -352,21 +372,35 @@ def on_limit(sel, name, hit, sid, issue_run):
         account["cooldown_until"] = max(float(account.get("cooldown_until", 0) or 0), until)
         account["reset_note"] = time.strftime("%m-%d %H:%M", time.localtime(until))
         sel.save_state(st)
-        another = any(other != name and eligible(sel, st, other, directory) for other, directory in sel.accounts)
     log(f"{name} could not continue ({note}); cooling down until {time.strftime('%m-%d %H:%M', time.localtime(until))}")
-    if not another:
-        log("no other Claude account has room; the issue stays as it is")
+    if not issue_run:
+        return
+    if not any(logged_in(directory) for _, directory in sel.accounts):
+        log("no Claude account is logged in; cannot continue the issue")
         return
     divernote = shutil.which("divernote")
-    if issue_run and divernote:
+    if divernote:
         try:
             result = subprocess.run(
                 [divernote, "pi-message", "--session-id", sid, "--text",
                  CONTINUE_MESSAGE.replace("a Claude usage limit", "an expired Claude login")
                  if note == "Login expired" else CONTINUE_MESSAGE, "--json"],
-                capture_output=True, text=True, timeout=60,
+                # Divernote stops the issue's whole PTY process group after a
+                # quota error. Delivery must finish outside that dying group.
+                start_new_session=True, capture_output=True, text=True, timeout=60,
             )
-            log(f"continue queued for {sid}: {(result.stdout or result.stderr).strip()[:200]}")
+            detail = (result.stdout or result.stderr).strip()[:200]
+            if result.returncode != 0:
+                log(f"could not queue continue for {sid}: exit {result.returncode}: {detail}")
+                return
+            try:
+                receipt = json.loads(result.stdout)
+            except (ValueError, TypeError):
+                receipt = None
+            if not isinstance(receipt, dict) or receipt.get("status") not in ("queue", "starting", "later"):
+                log(f"could not confirm continue for {sid}: {detail}")
+                return
+            log(f"continue queued for {sid}: {detail}")
         except (OSError, subprocess.TimeoutExpired) as error:
             log(f"could not queue continue for {sid}: {error}")
 
